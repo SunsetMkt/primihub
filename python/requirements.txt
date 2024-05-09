@@ -25,7 +25,7 @@ requests
 matplotlib
 dp-accounting==0.3.0
 attrs~=21.4.0
-scipy~=1.7.1
+scipy~=1.13.0
 modin
 datasketches==4.1.0
 
