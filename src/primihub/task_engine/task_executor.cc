@@ -65,6 +65,11 @@ retcode TaskEngine::InitCommunication() {
   using LinkFactory = primihub::network::LinkFactory;
   link_mode_ = LinkMode::GRPC;
   link_ctx_ = LinkFactory::createLinkContext(link_mode_);
+  auto& server_config = primihub::ServerConfig::getInstance();
+  auto& host_cfg = server_config.getServiceConfig();
+  if (host_cfg.use_tls()) {
+    link_ctx_->initCertificate(server_config.getCertificateConfig());
+  }
   return retcode::SUCCESS;
 }
 
@@ -119,10 +124,13 @@ retcode TaskEngine::UpdateStatus(rpc::TaskStatus::StatusCode code_status,
 retcode TaskEngine::CreateTask() {
   try {
     using TaskFactory = primihub::task::TaskFactory;
-    task_ = TaskFactory::Create(this->node_id_, *task_request_,
+    auto result = TaskFactory::Create(this->node_id_, *task_request_,
                                 this->dataset_service_);
+    task_ = std::move(result.first);
+    std::string msg = std::move(result.second);
     if (task_ == nullptr) {
-      LOG(ERROR) << "create Task Failed";
+      LOG(ERROR) << msg;
+      UpdateStatus(rpc::TaskStatus::FAIL, msg);
       return retcode::FAIL;
     }
   } catch (std::exception& e) {

@@ -43,6 +43,7 @@ retcode KeywordPirOperatorServer::OnExecute(const PirDataType& input,
   size_t use_core_num = cpu_core_num / 2;
   LOG(INFO) << "ThreadPoolMgr thread count: " << use_core_num;
   ThreadPoolMgr::SetThreadCount(use_core_num);
+  int64_t client_data_size{0};
 
   auto params = SetPsiParams();
   CHECK_NULLPOINTER(params, retcode::FAIL);
@@ -59,8 +60,6 @@ retcode KeywordPirOperatorServer::OnExecute(const PirDataType& input,
     return retcode::SUCCESS;
   }
 
-  auto ret = ProcessPSIParams();
-  CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
   std::shared_ptr<SenderDB> sender_db{nullptr};
   if (DbCacheAvailable(this->options_.db_path)) {
     sender_db = LoadDbFromCache(this->options_.db_path);
@@ -81,15 +80,38 @@ retcode KeywordPirOperatorServer::OnExecute(const PirDataType& input,
         std::max<uint32_t>(max_bin_bundles_per_bundle_idx,
                            sender_db->get_bin_bundle_count(bundle_idx));
   }
-  ret = ProcessOprf();
-  CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
-
-  ret = ProcessQuery(sender_db);
-  CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
+  {
+    auto ret = ProcessQueryPolicy();
+    CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
+    ret = WaitForLoopNum();
+    CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
+  }
+  for (int32_t i = 0; i < this->loop_num_; i++) {
+    auto ret = ProcessPSIParams();
+    CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
+    ret = ProcessOprf();
+    CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
+    auto table_size =
+        static_cast<size_t>(this->table_size_ * PirConstant::table_size_factor);
+    auto block_size = this->query_data_size_ / table_size;
+    auto rem_size = this->query_data_size_ % table_size;
+    if (rem_size != 0) {
+      block_size++;
+    }
+    LOG(INFO) << "size of loop: " << block_size << " "
+        << "query_data_size: " << query_data_size_ << " "
+        << "table size: " << table_size;
+    for (size_t i = 0 ; i < block_size; i++) {
+      LOG(INFO) << "current loop: " << i << " total: " << block_size;
+      ret = ProcessQuery(sender_db);
+      CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
+      LOG(INFO) << "end of process loop: " << i;
+    }
+  }
   {
     std::string task_end;
     auto link_ctx = this->GetLinkContext();
-    ret = link_ctx->Recv(this->key_task_end_, ProxyNode(), &task_end);
+    auto ret = link_ctx->Recv(this->key_task_end_, ProxyNode(), &task_end);
     CHECK_RETCODE_WITH_RETVALUE(ret, retcode::FAIL);
     LOG(INFO) << "task status: " << task_end;
   }
@@ -220,22 +242,27 @@ retcode KeywordPirOperatorServer::ProcessPSIParams() {
 retcode KeywordPirOperatorServer::ProcessOprf() {
   CHECK_TASK_STOPPED(retcode::FAIL);
   VLOG(5) << "begin to process oprf";
-  std::string oprf_request_str;
+  std::string recv_data;
   auto link_ctx = this->GetLinkContext();
-  auto ret = link_ctx->Recv(this->key_, this->ProxyNode(), &oprf_request_str);
-  if (ret != retcode::SUCCESS || oprf_request_str.empty()) {
+  auto ret = link_ctx->Recv(this->key_, this->ProxyNode(), &recv_data);
+  if (ret != retcode::SUCCESS || recv_data.empty()) {
     LOG(ERROR) << "received oprf request from client failed ";
     return ret;
   }
-  VLOG(5) << "received oprf request: " << oprf_request_str.size();
+  VLOG(5) << "received oprf request: " << recv_data.size();
 
-  // // OPRFKey key_oprf;
+  auto slot_index = *reinterpret_cast<const IndexType*>(recv_data.c_str());
+  LOG(INFO) << "slot_index: " << slot_index;
+  auto oprf_request_str =
+      std::string(recv_data.begin() + sizeof(slot_index), recv_data.end());
+  // OPRFKey key_oprf;
   auto oprf_response =
       OPRFSender::ProcessQueries(oprf_request_str, *(this->oprf_key_));
-
+  query_data_size_ = oprf_request_str.size() / apsi::oprf::oprf_query_size;
   std::string oprf_response_str{
       reinterpret_cast<char*>(const_cast<unsigned char*>(oprf_response.data())),
       oprf_response.size()};
+  VLOG(5) << "qeury size from client: " << query_data_size_;
   // VLOG(5) << "send data size: " << oprf_response_str.size() << " "
   //         << "data content: " << oprf_response_str;
   return link_ctx->Send(this->response_key_, ProxyNode(), oprf_response_str);
@@ -248,19 +275,22 @@ retcode KeywordPirOperatorServer::ProcessQuery(
   auto seal_context = sender_db->get_seal_context();
   auto query_request = std::make_unique<SenderOperationQuery>();
 
-  std::string response_str;
+  std::string recv_data;
   auto ret = this->GetLinkContext()->Recv(this->key_,
-                                          this->ProxyNode(), &response_str);
+                                          this->ProxyNode(), &recv_data);
   if (ret != retcode::SUCCESS) {
     LOG(ERROR) << "received response failed";
     return retcode::FAIL;
   }
-  VLOG(5) << "received data length: " << response_str.size();
-  if (response_str.empty()) {
+  VLOG(5) << "received data length: " << recv_data.size();
+  if (recv_data.empty()) {
     LOG(ERROR) << "received data can not be empty";
     return retcode::FAIL;
   }
-  std::istringstream stream_in(response_str);
+  auto slot_index = *reinterpret_cast<const IndexType*>(recv_data.c_str());
+  LOG(INFO) << "slot_index: " << slot_index;
+  auto query_data = std::string(recv_data.begin() + sizeof(IndexType), recv_data.end());
+  std::istringstream stream_in(query_data);
   try {
     query_request->load(stream_in, seal_context);
   } catch (std::exception& e) {
@@ -418,8 +448,8 @@ retcode KeywordPirOperatorServer::ProcessQuery(
   for (auto& f : futures) {
     f.get();
   }
-  link_ctx->CheckSendCompleteStatus(this->response_key_,
-                                    ProxyNode(), package_count);
+  // link_ctx->CheckSendCompleteStatus(this->response_key_,
+  //                                   ProxyNode(), package_count);
   VLOG(5) << "Finished processing query request";
   return retcode::SUCCESS;
 }
@@ -599,15 +629,16 @@ std::unique_ptr<apsi::PSIParams> KeywordPirOperatorServer::SetPsiParams() {
   }
 
   // std::unique_ptr<PSIParams> params{nullptr};
-  auto params = std::make_unique<PSIParams>(PSIParams::Load(params_json));
+  auto psi_params = std::make_unique<PSIParams>(PSIParams::Load(params_json));
   SCopedTimer timer;
   std::ostringstream param_ss;
-  size_t param_size = params->save(param_ss);
+  size_t param_size = psi_params->save(param_ss);
   psi_params_str_ = param_ss.str();
   auto time_cost = timer.timeElapse();
+  this->table_size_ = psi_params->table_params().table_size;
   VLOG(5) << "param_size: " << param_size << " time cost(ms): " << time_cost;
   VLOG(5) << "param_content: " << psi_params_str_.size();
-  return params;
+  return psi_params;
 }
 
 bool KeywordPirOperatorServer::DbCacheAvailable(const std::string& db_path) {
@@ -625,6 +656,42 @@ KeywordPirOperatorServer::LoadDbFromCache(const std::string& db_file_cache) {
   auto time_cost = timer.timeElapse();
   VLOG(5) << "LoadDbFromCache cost time(ms): " << time_cost;
   return sender_db;
+}
+
+retcode KeywordPirOperatorServer::ProcessQueryPolicy() {
+  CHECK_TASK_STOPPED(retcode::FAIL);
+  std::string request_type_str;
+  auto link_ctx = this->GetLinkContext();
+  CHECK_NULLPOINTER_WITH_ERROR_MSG(link_ctx, "LinkContext is empty");
+  auto ret = link_ctx->Recv(this->key_, ProxyNode(), &request_type_str);
+  if (ret != retcode::SUCCESS) {
+    LOG(ERROR) << "recv request from : " << PeerNode().to_string() << "failed";
+    return retcode::FAIL;
+  }
+  IndexType query_policy{1};
+  auto query_policy_str =
+      std::string(TO_CHAR(&query_policy), sizeof(query_policy));
+  ret = link_ctx->Send(this->response_key_, ProxyNode(), query_policy_str);
+  if (ret != retcode::SUCCESS) {
+    LOG(ERROR) << "send qeury policy to " << PeerNode().to_string() << "failed";
+    return retcode::FAIL;
+  }
+  return retcode::SUCCESS;
+}
+
+retcode KeywordPirOperatorServer::WaitForLoopNum() {
+  CHECK_TASK_STOPPED(retcode::FAIL);
+  std::string loop_num_str;
+  auto link_ctx = this->GetLinkContext();
+  CHECK_NULLPOINTER_WITH_ERROR_MSG(link_ctx, "LinkContext is empty");
+  auto ret = link_ctx->Recv(this->loop_num_key_, ProxyNode(), &loop_num_str);
+  if (ret != retcode::SUCCESS || loop_num_str.empty()) {
+    LOG(ERROR) << "recv loop_num from : " << PeerNode().to_string() << "failed";
+    return retcode::FAIL;
+  }
+  this->loop_num_ = *reinterpret_cast<const IndexType*>(loop_num_str.c_str());
+  VLOG(5) << "LOOP NUM: " << this->loop_num_;
+  return retcode::SUCCESS;
 }
 
 }  // namespace primihub::pir
